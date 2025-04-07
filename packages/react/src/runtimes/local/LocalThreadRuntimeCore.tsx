@@ -1,9 +1,11 @@
 import { generateId } from "../../internal";
-import type { AppendMessage, ThreadAssistantMessage } from "../../types";
+import type { AppendMessage, ThreadAssistantMessage, ThreadMessage } from "../../types";
+import { ExportedMessageRepository } from "../utils/MessageRepository";
 import { fromCoreMessage } from "../edge";
 import type { ChatModelAdapter, ChatModelRunResult } from "./ChatModelAdapter";
 import { shouldContinue } from "./shouldContinue";
 import { LocalRuntimeOptionsBase } from "./LocalRuntimeOptions";
+import { ThreadHistoryAdapter } from "../adapters/thread-history/ThreadHistoryAdapter";
 import {
   AddToolResultOptions,
   ThreadSuggestion,
@@ -14,6 +16,14 @@ import {
 import { BaseThreadRuntimeCore } from "../core/BaseThreadRuntimeCore";
 import { RunConfig } from "../../types/AssistantTypes";
 import { ModelContextProvider } from "../../model-context";
+
+interface HistoryAdapterWithSave extends ThreadHistoryAdapter {
+  saveFullHistory(repositoryData: ExportedMessageRepository): Promise<void>;
+}
+
+function hasSaveFullHistory(adapter: ThreadHistoryAdapter | undefined): adapter is HistoryAdapterWithSave {
+  return typeof (adapter as any)?.saveFullHistory === 'function';
+}
 
 export class LocalThreadRuntimeCore
   extends BaseThreadRuntimeCore
@@ -115,6 +125,21 @@ export class LocalThreadRuntimeCore
     return this._loadPromise;
   }
 
+  private async saveHistoryIfSupported() {
+    const historyAdapter = this._options.adapters.history;
+    if (hasSaveFullHistory(historyAdapter)) {
+      try {
+        const exportedData = this.repository.export();
+        historyAdapter.saveFullHistory(exportedData)
+          .catch(err => {
+            console.error("Error saving history in background:", err);
+          });
+      } catch (error) {
+        console.error("Error exporting repository data for saving:", error);
+      }
+    }
+  }
+
   public async append(message: AppendMessage): Promise<void> {
     this.ensureInitialized();
 
@@ -122,10 +147,6 @@ export class LocalThreadRuntimeCore
       attachments: message.attachments,
     });
     this.repository.addOrUpdateMessage(message.parentId, newMessage);
-    this._options.adapters.history?.append({
-      parentId: message.parentId,
-      message: newMessage,
-    });
 
     const startRun = message.startRun ?? message.role === "user";
     if (startRun) {
@@ -136,6 +157,7 @@ export class LocalThreadRuntimeCore
       });
     } else {
       this.repository.resetHead(newMessage.id);
+      await this.saveHistoryIfSupported();
       this._notifySubscribers();
     }
   }
@@ -151,8 +173,8 @@ export class LocalThreadRuntimeCore
     this.ensureInitialized();
 
     this.repository.resetHead(parentId);
+    await this.saveHistoryIfSupported();
 
-    // add assistant message
     const id = generateId();
     let message: ThreadAssistantMessage = {
       id,
@@ -183,8 +205,10 @@ export class LocalThreadRuntimeCore
           runCallback,
         );
         runCallback = undefined;
+        await this.saveHistoryIfSupported();
       } while (shouldContinue(message, this._options.unstable_humanToolNames));
     } finally {
+      await this.saveHistoryIfSupported();
       this._notifyEventSubscribers("run-end");
     }
 
@@ -219,7 +243,6 @@ export class LocalThreadRuntimeCore
   ) {
     const messages = this.repository.getMessages();
 
-    // abort existing run
     this.abortController?.abort();
     this.abortController = new AbortController();
 
@@ -273,7 +296,6 @@ export class LocalThreadRuntimeCore
 
     const steps = message.metadata?.steps?.length ?? 0;
     if (steps >= maxSteps) {
-      // reached max tool steps
       updateMessage({
         status: {
           type: "incomplete",
@@ -309,7 +331,6 @@ export class LocalThreadRuntimeCore
         },
       });
 
-      // handle async iterator for streaming results
       if (Symbol.asyncIterator in promiseOrGenerator) {
         for await (const r of promiseOrGenerator) {
           updateMessage(r);
@@ -328,7 +349,6 @@ export class LocalThreadRuntimeCore
     } catch (e) {
       this.abortController = null;
 
-      // TODO this should be handled by the run result stream
       if (e instanceof Error && e.name === "AbortError") {
         updateMessage({
           status: { type: "incomplete", reason: "cancelled" },
@@ -348,15 +368,17 @@ export class LocalThreadRuntimeCore
         throw e;
       }
     } finally {
-      if (
-        message.status.type === "complete" ||
-        message.status.type === "incomplete"
-      ) {
-        await this._options.adapters.history?.append({
-          parentId,
-          message: message,
-        });
-      }
+      // Remove final save from here; handled in startRun's finally block
+      // or after the roundtrip loop in startRun
+      // if (
+      //   message.status.type === "complete" ||
+      //   message.status.type === "incomplete"
+      // ) {
+      //   await this._options.adapters.history?.append({
+      //     parentId,
+      //     message: message,
+      //   });
+      // }
     }
     return message;
   }
@@ -366,7 +388,7 @@ export class LocalThreadRuntimeCore
     this.abortController = null;
   }
 
-  public addToolResult({
+  public async addToolResult({
     messageId,
     toolCallId,
     result,
@@ -399,6 +421,7 @@ export class LocalThreadRuntimeCore
       content: newContent,
     };
     this.repository.addOrUpdateMessage(parentId, message);
+    await this.saveHistoryIfSupported();
 
     if (
       added &&
@@ -406,5 +429,16 @@ export class LocalThreadRuntimeCore
     ) {
       this.performRoundtrip(parentId, message, this._lastRunConfig);
     }
+  }
+
+  async edit(messageId: string, content: any): Promise<void> {
+    console.log("LocalThreadRuntimeCore: edit called (example)");
+    await this.saveHistoryIfSupported();
+    this._notifySubscribers();
+  }
+
+  async reload(messageId: string): Promise<void> {
+    console.log("LocalThreadRuntimeCore: reload called (example)");
+    this._notifySubscribers();
   }
 }
